@@ -10,16 +10,15 @@ use std::{
     time::Duration,
 };
 
-const COUNT: usize = 1024;
-
+const SIZE: usize = 16;
 #[derive(Clone)]
-struct BigData([u64; COUNT]);
+struct BigData([u8; SIZE]);
 
 fn generate() -> Vec<BigData> {
     let mut rng = rand::thread_rng();
     (0..10_240)
         .map(|_| {
-            let mut array = [0u64; COUNT];
+            let mut array = [0; SIZE];
             rng.fill(&mut array);
             BigData(array)
         })
@@ -35,43 +34,57 @@ fn looped(data: &[BigData]) -> impl Iterator<Item = BigData> + '_ {
     })
 }
 
-pub fn criterion_benchmark(c: &mut Criterion) {
-    let data = generate();
-    let mut iter = looped(&data);
+fn ping_pong_server<T>(
+    requests: &FixedQueue<T>,
+    responds: &FixedQueue<T>,
+    running: &Arc<AtomicBool>,
+) -> thread::JoinHandle<()>
+where
+    T: Send + 'static,
+{
+    let requests = requests.clone();
+    let responds = responds.clone();
+    let running = Arc::clone(&running);
+    thread::spawn(move || {
+        while running.load(Ordering::Relaxed) {
+            while let Some(item) = requests.try_pop_front_timeout(Duration::from_secs(1)) {
+                responds.push_back(item);
+            }
+        }
+    })
+}
 
-    let mut group = c.benchmark_group("shmem queue");
-    group.throughput(Throughput::Bytes(mem::size_of::<BigData>() as u64));
-    let requests = FixedQueue::<BigData>::new(1024).unwrap();
-    let responds = FixedQueue::<BigData>::new(1024).unwrap();
+fn bench_length(b: &mut criterion::Bencher<'_>, data: &[BigData], queue_length: usize) {
+    let mut iter = looped(data);
+    let requests = FixedQueue::<BigData>::new(queue_length).unwrap();
+    let responds = FixedQueue::<BigData>::new(queue_length).unwrap();
 
     let running = Arc::new(AtomicBool::new(true));
 
-    let server = {
-        let requests = requests.clone();
-        let responds = responds.clone();
-        let running = Arc::clone(&running);
-        thread::spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                if let Some(item) = requests.try_pop_front_timeout(Duration::from_secs(1)) {
-                    responds.push_back(item);
-                }
-            }
-        })
-    };
+    let servers: Vec<_> = (0..1)
+        .map(|_| ping_pong_server(&requests, &responds, &running))
+        .collect();
 
-    group.bench_function("ping", |b| {
-        b.iter(|| {
-            requests.push_back(iter.next().unwrap());
-            if running.load(Ordering::Relaxed) {
-                Some(responds.pop_back())
-            } else {
-                None
-            }
-        });
+    b.iter(|| {
+        requests.push_back(iter.next().unwrap());
+        responds.pop_back()
     });
-    group.finish();
     running.store(false, Ordering::Relaxed);
-    let _ = server.join();
+    servers.into_iter().for_each(|handle| {
+        let _ = handle.join();
+    });
+}
+
+pub fn criterion_benchmark(c: &mut Criterion) {
+    let mut group = c.benchmark_group("shmem queue");
+    group.throughput(Throughput::Bytes(mem::size_of::<BigData>() as u64));
+    for &capacity in &[1, 10, 100, 1000] {
+        let data = generate();
+        group.bench_function(format!("ping, cap = {}", capacity), |b| {
+            bench_length(b, &data, capacity)
+        });
+    }
+    group.finish();
 }
 
 criterion_group!(benches, criterion_benchmark);
