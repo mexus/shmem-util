@@ -7,9 +7,10 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
     sync::Arc,
     thread,
+    time::Duration,
 };
 
-const COUNT: usize = 512;
+const COUNT: usize = 1024;
 
 #[derive(Clone)]
 struct BigData([u64; COUNT]);
@@ -40,39 +41,37 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("shmem queue");
     group.throughput(Throughput::Bytes(mem::size_of::<BigData>() as u64));
+    let requests = FixedQueue::<BigData>::new(1024).unwrap();
+    let responds = FixedQueue::<BigData>::new(1024).unwrap();
 
-    group.bench_function("ping", |b| {
-        let requests = FixedQueue::<BigData>::new(1024).unwrap();
-        let responds = FixedQueue::<BigData>::new(1024).unwrap();
+    let running = Arc::new(AtomicBool::new(true));
 
-        let running = Arc::new(AtomicBool::new(true));
-
-        let server = {
-            let requests = requests.clone();
-            let responds = responds.clone();
-            let running = Arc::clone(&running);
-            thread::spawn(move || {
-                while running.load(Ordering::Relaxed) {
-                    if let Some(item) = requests.pop_front() {
-                        let _ = responds.push_back(item);
-                    }
-                }
-            })
-        };
-
-        b.iter(|| {
-            let _ = requests.push_back(iter.next().unwrap());
+    let server = {
+        let requests = requests.clone();
+        let responds = responds.clone();
+        let running = Arc::clone(&running);
+        thread::spawn(move || {
             while running.load(Ordering::Relaxed) {
-                if let Some(item) = responds.pop_back() {
-                    return Some(item);
+                if let Some(item) = requests.try_pop_front_timeout(Duration::from_secs(1)) {
+                    responds.push_back(item);
                 }
             }
-            None
+        })
+    };
+
+    group.bench_function("ping", |b| {
+        b.iter(|| {
+            requests.push_back(iter.next().unwrap());
+            if running.load(Ordering::Relaxed) {
+                Some(responds.pop_back())
+            } else {
+                None
+            }
         });
-        running.store(false, Ordering::Relaxed);
-        let _ = server.join();
     });
     group.finish();
+    running.store(false, Ordering::Relaxed);
+    let _ = server.join();
 }
 
 criterion_group!(benches, criterion_benchmark);
