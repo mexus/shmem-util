@@ -2,7 +2,8 @@
 
 use crate::memmap::MemmapAlloc;
 use alloc_collections::{boxes::CustomBox, deque::VecDeque, raw_vec, Alloc};
-use core::ptr::NonNull;
+use core::{alloc::Layout, ptr::NonNull};
+use nix::unistd::Pid;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -14,6 +15,8 @@ struct Inner<T> {
 
 pub struct FixedQueue<T> {
     inner: NonNull<Inner<T>>,
+    creator_pid: Pid,
+    owner: bool,
 }
 
 unsafe impl<T: Send> Send for FixedQueue<T> {}
@@ -21,7 +24,11 @@ unsafe impl<T: Sync> Sync for FixedQueue<T> {}
 
 impl<T> Clone for FixedQueue<T> {
     fn clone(&self) -> Self {
-        FixedQueue { inner: self.inner }
+        FixedQueue {
+            inner: self.inner,
+            creator_pid: self.creator_pid,
+            owner: false,
+        }
     }
 }
 
@@ -35,7 +42,51 @@ impl<T> FixedQueue<T> {
 
         Ok(FixedQueue {
             inner: inner.cast(),
+            creator_pid: Pid::this(),
+            owner: true,
         })
+    }
+
+    /// Prevents this queue from being uninitialized when it's dropped in the process that created
+    /// the queue.
+    ///
+    /// If called on the original object, returns a `FixedQueueDestructor` that might be called
+    /// from any process to free the memory occupied by the queue.
+    pub fn keep(&mut self) -> Option<FixedQueueDestructor<T>> {
+        if self.owner && self.creator_pid == Pid::this() {
+            self.creator_pid = Pid::from_raw(0);
+            Some(FixedQueueDestructor(self.inner))
+        } else {
+            None
+        }
+    }
+}
+
+/// A queue destroyer.
+pub struct FixedQueueDestructor<T>(NonNull<Inner<T>>);
+
+impl<T> FixedQueueDestructor<T> {
+    /// # Safety
+    ///
+    /// The caller must ensure that no other instances of the queue exist
+    /// (in other processes too!).
+    pub unsafe fn destroy(self) {
+        let _ = CustomBox::<Inner<T>, _>::from_raw_parts(
+            self.0.cast(),
+            Layout::new::<Inner<T>>(),
+            MemmapAlloc,
+        );
+    }
+}
+
+unsafe impl<T: Send> Send for FixedQueueDestructor<T> {}
+unsafe impl<T: Sync> Sync for FixedQueueDestructor<T> {}
+
+impl<T> Drop for FixedQueue<T> {
+    fn drop(&mut self) {
+        if let Some(destructor) = self.keep() {
+            unsafe { destructor.destroy() }
+        }
     }
 }
 
