@@ -47,7 +47,7 @@ where
     let running = Arc::clone(&running);
     thread::spawn(move || {
         while running.load(Ordering::Relaxed) {
-            while let Some(item) = requests.try_pop_front_timeout(Duration::from_secs(1)) {
+            while let Some(item) = requests.try_pop_front_timeout(Duration::from_millis(100)) {
                 responds.push_back(item);
             }
         }
@@ -87,5 +87,9 @@ pub fn criterion_benchmark(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, criterion_benchmark);
+criterion_group! {
+    name = benches;
+    config = Criterion::default().measurement_time(Duration::from_secs(30));
+    targets = criterion_benchmark
+}
 criterion_main!(benches);

@@ -1,9 +1,9 @@
 //! Fixed queue.
 
 use crate::memmap::MemmapAlloc;
-use alloc_collections::{boxes::CustomBox, deque::VecDeque, raw_vec};
+use alloc_collections::{boxes::CustomBox, deque::VecDeque, raw_vec, Alloc};
 use core::ptr::NonNull;
-use parking_lot::{Condvar, Mutex};
+use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 struct Inner<T> {
@@ -139,28 +139,65 @@ impl<T> Inner<T> {
             popped,
         })
     }
+
+    fn push_back_inner<A: Alloc>(&self, mut guard: MutexGuard<'_, VecDeque<T, A>>, item: T) {
+        let r = guard.push_back(item);
+        debug_assert!(r.is_ok());
+        if guard.len() == 1 {
+            // This means we've pushed the first element
+            self.pushed.notify_one();
+        }
+    }
+
+    fn push_front_inner<A: Alloc>(&self, mut guard: MutexGuard<'_, VecDeque<T, A>>, item: T) {
+        let r = guard.push_front(item);
+        debug_assert!(r.is_ok());
+        if guard.len() == 1 {
+            // This means we've pushed the first element
+            self.pushed.notify_one();
+        }
+    }
+
+    fn pop_back_inner<A: Alloc>(&self, mut queue: MutexGuard<'_, VecDeque<T, A>>) -> Option<T> {
+        if let Some(item) = queue.pop_back() {
+            if queue.remaining_capacity() == 1 {
+                // This means we've just made a space for others to push.
+                self.popped.notify_one();
+            }
+            Some(item)
+        } else {
+            None
+        }
+    }
+
+    fn pop_front_inner<A: Alloc>(&self, mut queue: MutexGuard<'_, VecDeque<T, A>>) -> Option<T> {
+        if let Some(item) = queue.pop_front() {
+            if queue.remaining_capacity() == 1 {
+                // This means we've just made a space for others to push.
+                self.popped.notify_one();
+            }
+            Some(item)
+        } else {
+            None
+        }
+    }
 }
 
 impl<T> Inner<T> {
     pub fn push_back(&self, item: T) {
         let mut queue = self.mutex.lock();
-        loop {
-            if queue.remaining_capacity() != 0 {
-                break;
-            }
+        if queue.remaining_capacity() == 0 {
             self.popped.wait(&mut queue);
         }
-        let _ = queue.push_back(item);
-        self.pushed.notify_one();
+        self.push_back_inner(queue, item)
     }
 
     pub fn try_push_back(&self, item: T) -> Result<(), T> {
-        let mut queue = self.mutex.lock();
+        let queue = self.mutex.lock();
         if queue.remaining_capacity() == 0 {
             Err(item)
         } else {
-            let _ = queue.push_back(item);
-            self.pushed.notify_one();
+            self.push_back_inner(queue, item);
             Ok(())
         }
     }
@@ -172,42 +209,31 @@ impl<T> Inner<T> {
 
     pub fn try_push_back_until(&self, item: T, until: Instant) -> Result<(), T> {
         let mut queue = self.mutex.lock();
-        while Instant::now() < until {
-            if queue.remaining_capacity() != 0 {
-                break;
-            }
-            self.popped.wait_until(&mut queue, until);
-        }
         if queue.remaining_capacity() == 0 {
-            Err(item)
-        } else {
-            let _ = queue.push_back(item);
-            self.pushed.notify_one();
-            Ok(())
+            if self.popped.wait_until(&mut queue, until).timed_out() {
+                return Err(item);
+            }
         }
+        self.push_back_inner(queue, item);
+        Ok(())
     }
 }
 
 impl<T> Inner<T> {
     pub fn push_front(&self, item: T) {
         let mut queue = self.mutex.lock();
-        loop {
-            if queue.remaining_capacity() != 0 {
-                break;
-            }
+        if queue.remaining_capacity() == 0 {
             self.popped.wait(&mut queue);
         }
-        let _ = queue.push_front(item);
-        self.pushed.notify_one();
+        self.push_front_inner(queue, item)
     }
 
     pub fn try_push_front(&self, item: T) -> Result<(), T> {
-        let mut queue = self.mutex.lock();
+        let queue = self.mutex.lock();
         if queue.remaining_capacity() == 0 {
             Err(item)
         } else {
-            let _ = queue.push_front(item);
-            self.pushed.notify_one();
+            self.push_front_inner(queue, item);
             Ok(())
         }
     }
@@ -219,41 +245,29 @@ impl<T> Inner<T> {
 
     pub fn try_push_front_until(&self, item: T, until: Instant) -> Result<(), T> {
         let mut queue = self.mutex.lock();
-        while Instant::now() < until {
-            if queue.remaining_capacity() != 0 {
-                break;
-            }
-            self.popped.wait_until(&mut queue, until);
-        }
         if queue.remaining_capacity() == 0 {
-            Err(item)
-        } else {
-            let _ = queue.push_front(item);
-            self.pushed.notify_one();
-            Ok(())
+            if self.popped.wait_until(&mut queue, until).timed_out() {
+                return Err(item);
+            }
         }
+        self.push_front_inner(queue, item);
+        Ok(())
     }
 }
 
 impl<T> Inner<T> {
     pub fn pop_back(&self) -> T {
         let mut queue = self.mutex.lock();
-        if let Some(item) = queue.pop_back() {
-            self.popped.notify_one();
-            item
-        } else {
+        if queue.len() == 0 {
             self.pushed.wait(&mut queue);
-            let item = queue.pop_back().expect("Error while popping");
-            self.popped.notify_one();
-            item
         }
+
+        self.pop_back_inner(queue).expect("Error while popping")
     }
 
     pub fn try_pop_back(&self) -> Option<T> {
-        let mut queue = self.mutex.lock();
-        let item = queue.pop_back()?;
-        self.popped.notify_one();
-        Some(item)
+        let queue = self.mutex.lock();
+        self.pop_back_inner(queue)
     }
 
     pub fn try_pop_back_timeout(&self, timeout: Duration) -> Option<T> {
@@ -263,37 +277,27 @@ impl<T> Inner<T> {
 
     pub fn try_pop_back_until(&self, until: Instant) -> Option<T> {
         let mut queue = self.mutex.lock();
-        while Instant::now() < until {
-            if queue.capacity() != 0 {
-                break;
+        if queue.len() == 0 {
+            if self.pushed.wait_until(&mut queue, until).timed_out() {
+                return None;
             }
-            self.pushed.wait_until(&mut queue, until);
         }
-        let item = queue.pop_back()?;
-        self.popped.notify_one();
-        Some(item)
+        Some(self.pop_back_inner(queue).expect("Error while popping"))
     }
 }
 
 impl<T> Inner<T> {
     pub fn pop_front(&self) -> T {
         let mut queue = self.mutex.lock();
-        if let Some(item) = queue.pop_front() {
-            self.popped.notify_one();
-            item
-        } else {
+        if queue.len() == 0 {
             self.pushed.wait(&mut queue);
-            let item = queue.pop_front().expect("Error while popping");
-            self.popped.notify_one();
-            item
         }
+        self.pop_front_inner(queue).expect("Pop failed")
     }
 
     pub fn try_pop_front(&self) -> Option<T> {
-        let mut queue = self.mutex.lock();
-        let item = queue.pop_front()?;
-        self.popped.notify_one();
-        Some(item)
+        let queue = self.mutex.lock();
+        self.pop_front_inner(queue)
     }
 
     pub fn try_pop_front_timeout(&self, timeout: Duration) -> Option<T> {
@@ -303,15 +307,12 @@ impl<T> Inner<T> {
 
     pub fn try_pop_front_until(&self, until: Instant) -> Option<T> {
         let mut queue = self.mutex.lock();
-        while Instant::now() < until {
-            if queue.capacity() != 0 {
-                break;
+        if queue.len() == 0 {
+            if self.pushed.wait_until(&mut queue, until).timed_out() {
+                return None;
             }
-            self.pushed.wait_until(&mut queue, until);
         }
-        let item = queue.pop_front()?;
-        self.popped.notify_one();
-        Some(item)
+        Some(self.pop_front_inner(queue).expect("Pop failed"))
     }
 }
 

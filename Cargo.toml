@@ -20,3 +20,7 @@ rand = "0.7.3"
 [[bench]]
 name = "queue"
 harness = false
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
