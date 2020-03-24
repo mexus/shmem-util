@@ -1,11 +1,38 @@
 //! Fixed queue.
 
-use crate::memmap::MemmapAlloc;
-use alloc_collections::{boxes::CustomBox, deque::VecDeque, raw_vec, Alloc};
+use crate::{allocator::ShmemAlloc, memmap::MemmapAlloc};
+use alloc_collections::{boxes::CustomBox, deque::VecDeque, raw_vec, Alloc, IndexMap, Vec};
 use core::{alloc::Layout, ptr::NonNull};
 use nix::unistd::Pid;
 use parking_lot::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Marker trait for types that are safe to be transmitted between processes.
+pub unsafe trait ShmemSafe {}
+
+unsafe impl ShmemSafe for u8 {}
+unsafe impl ShmemSafe for u16 {}
+unsafe impl ShmemSafe for u32 {}
+unsafe impl ShmemSafe for u64 {}
+unsafe impl ShmemSafe for u128 {}
+unsafe impl ShmemSafe for usize {}
+
+unsafe impl ShmemSafe for i8 {}
+unsafe impl ShmemSafe for i16 {}
+unsafe impl ShmemSafe for i32 {}
+unsafe impl ShmemSafe for i64 {}
+unsafe impl ShmemSafe for i128 {}
+unsafe impl ShmemSafe for isize {}
+
+unsafe impl ShmemSafe for char {}
+
+unsafe impl<T: ShmemSafe> ShmemSafe for VecDeque<T, MemmapAlloc> {}
+unsafe impl<T: ShmemSafe> ShmemSafe for Vec<T, MemmapAlloc> {}
+unsafe impl<T: ShmemSafe> ShmemSafe for IndexMap<T, MemmapAlloc> {}
+
+unsafe impl<T: ShmemSafe> ShmemSafe for VecDeque<T, ShmemAlloc> {}
+unsafe impl<T: ShmemSafe> ShmemSafe for Vec<T, ShmemAlloc> {}
+unsafe impl<T: ShmemSafe> ShmemSafe for IndexMap<T, ShmemAlloc> {}
 
 struct Inner<T> {
     mutex: Mutex<VecDeque<T, MemmapAlloc>>,
@@ -13,16 +40,16 @@ struct Inner<T> {
     popped: Condvar,
 }
 
-pub struct FixedQueue<T> {
+pub struct FixedQueue<T: ShmemSafe> {
     inner: NonNull<Inner<T>>,
     creator_pid: Pid,
     owner: bool,
 }
 
-unsafe impl<T: Send> Send for FixedQueue<T> {}
-unsafe impl<T: Sync> Sync for FixedQueue<T> {}
+unsafe impl<T: Send + ShmemSafe> Send for FixedQueue<T> {}
+unsafe impl<T: Sync + ShmemSafe> Sync for FixedQueue<T> {}
 
-impl<T> Clone for FixedQueue<T> {
+impl<T: ShmemSafe> Clone for FixedQueue<T> {
     fn clone(&self) -> Self {
         FixedQueue {
             inner: self.inner,
@@ -32,7 +59,7 @@ impl<T> Clone for FixedQueue<T> {
     }
 }
 
-impl<T> FixedQueue<T> {
+impl<T: ShmemSafe> FixedQueue<T> {
     /// Creates a fixed-sized queue in shared memory.
     pub fn new(capacity: usize) -> Result<Self, raw_vec::Error> {
         let inner = Inner::<T>::new(capacity)?;
@@ -82,7 +109,7 @@ impl<T> FixedQueueDestructor<T> {
 unsafe impl<T: Send> Send for FixedQueueDestructor<T> {}
 unsafe impl<T: Sync> Sync for FixedQueueDestructor<T> {}
 
-impl<T> Drop for FixedQueue<T> {
+impl<T: ShmemSafe> Drop for FixedQueue<T> {
     fn drop(&mut self) {
         if let Some(destructor) = self.keep() {
             unsafe { destructor.destroy() }
@@ -90,7 +117,7 @@ impl<T> Drop for FixedQueue<T> {
     }
 }
 
-impl<T> FixedQueue<T> {
+impl<T: ShmemSafe> FixedQueue<T> {
     /// Pushes an item to the back of the queue.
     pub fn push_back(&self, item: T) {
         unsafe { self.inner.as_ref() }.push_back(item)
@@ -112,7 +139,7 @@ impl<T> FixedQueue<T> {
     }
 }
 
-impl<T> FixedQueue<T> {
+impl<T: ShmemSafe> FixedQueue<T> {
     /// Pushes an item to the front of the queue.
     pub fn push_front(&self, item: T) {
         unsafe { self.inner.as_ref() }.push_front(item)
@@ -134,7 +161,7 @@ impl<T> FixedQueue<T> {
     }
 }
 
-impl<T> FixedQueue<T> {
+impl<T: ShmemSafe> FixedQueue<T> {
     /// Pops an element from the back of queue.
     pub fn pop_back(&self) -> T {
         unsafe { self.inner.as_ref() }.pop_back()
@@ -156,7 +183,7 @@ impl<T> FixedQueue<T> {
     }
 }
 
-impl<T> FixedQueue<T> {
+impl<T: ShmemSafe> FixedQueue<T> {
     /// Pops an element from the front of queue.
     pub fn pop_front(&self) -> T {
         unsafe { self.inner.as_ref() }.pop_front()

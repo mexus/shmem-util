@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rand::Rng;
-use shmem::fixed_queue::FixedQueue;
+use shmem::fixed_queue::{FixedQueue, ShmemSafe};
 use std::{
     iter::repeat_with,
     mem,
@@ -13,6 +13,8 @@ use std::{
 const SIZE: usize = 16;
 #[derive(Clone)]
 struct BigData([u8; SIZE]);
+
+unsafe impl ShmemSafe for BigData {}
 
 fn generate() -> Vec<BigData> {
     let mut rng = rand::thread_rng();
@@ -34,7 +36,7 @@ fn looped(data: &[BigData]) -> impl Iterator<Item = BigData> + '_ {
     })
 }
 
-fn ping_pong_server<T>(
+fn ping_pong_server<T: ShmemSafe>(
     requests: &FixedQueue<T>,
     responds: &FixedQueue<T>,
     running: &Arc<AtomicBool>,
