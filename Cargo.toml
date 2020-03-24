@@ -1,5 +1,5 @@
 [package]
-name = "shmem"
+name = "shmem-utils"
 version = "0.1.0"
 authors = ["mexus <gilaldpellaeon@gmail.com>"]
 edition = "2018"
