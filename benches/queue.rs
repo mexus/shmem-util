@@ -1,6 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rand::Rng;
-use shmem::fixed_queue::{FixedQueue, ShmemSafe};
+use shmem_utils::fixed_queue::{FixedQueue, ShmemSafe};
 use std::{
     iter::repeat_with,
     mem,
