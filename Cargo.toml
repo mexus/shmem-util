@@ -1,6 +1,6 @@
 [package]
 name = "shmem-utils"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["mexus <gilaldpellaeon@gmail.com>"]
 edition = "2018"
 
@@ -12,6 +12,7 @@ parking_lot = "0.10.0"
 alloc-collections = { git = "https://github.com/mexus/alloc-collections", version = "0.3.1", tag = "0.3.1" }
 log = "0.4.8"
 once_cell = "1.3.1"
+lock_api = "0.3.3"
 
 [dev-dependencies]
 criterion = "0.3.1"

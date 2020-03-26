@@ -36,8 +36,8 @@ unsafe impl<T: ShmemSafe> ShmemSafe for IndexMap<T, ShmemAlloc> {}
 
 struct Inner<T> {
     mutex: Mutex<VecDeque<T, MemmapAlloc>>,
-    pushed: Condvar,
-    popped: Condvar,
+    item_available: Condvar,
+    space_available: Condvar,
 }
 
 pub struct FixedQueue<T: ShmemSafe> {
@@ -48,6 +48,7 @@ pub struct FixedQueue<T: ShmemSafe> {
 
 unsafe impl<T: Send + ShmemSafe> Send for FixedQueue<T> {}
 unsafe impl<T: Sync + ShmemSafe> Sync for FixedQueue<T> {}
+unsafe impl<T: ShmemSafe> ShmemSafe for FixedQueue<T> {}
 
 impl<T: ShmemSafe> Clone for FixedQueue<T> {
     fn clone(&self) -> Self {
@@ -87,9 +88,26 @@ impl<T: ShmemSafe> FixedQueue<T> {
             None
         }
     }
+
+    /// Attemps to lock the internal mutex within a given timeout, and forcibly unlocks it if the
+    /// attempt fails.
+    ///
+    /// This method is intended to be used when a child process holding the mutex dies before
+    /// releasing the lock, so it is advised to call this method if and only if the parent process
+    /// (i.e. the one that created the queue) receives `SIGCHLD` signal, notifying its child was
+    /// killed/dumped/etc.
+    ///
+    /// # Safety
+    ///
+    /// Calling this method can cause undefined behaviour when there is a live process holding the
+    /// lock.
+    pub unsafe fn check_recover(&mut self, timeout: Duration) {
+        self.inner.as_mut().check_recover(timeout)
+    }
 }
 
 /// A queue destroyer.
+#[must_use = "The queue won't be freed unless `destroy` is called!"]
 pub struct FixedQueueDestructor<T>(NonNull<Inner<T>>);
 
 impl<T> FixedQueueDestructor<T> {
@@ -209,13 +227,24 @@ impl<T> Inner<T> {
     pub fn new(capacity: usize) -> Result<Self, raw_vec::Error> {
         let queue = VecDeque::<T, _>::with_capacity_in(capacity, MemmapAlloc)?;
         let queue = Mutex::new(queue);
-        let pushed = Condvar::new();
-        let popped = Condvar::new();
         Ok(Inner {
             mutex: queue,
-            pushed,
-            popped,
+            item_available: Condvar::new(),
+            space_available: Condvar::new(),
         })
+    }
+
+    /// Tries to lock the internal mutex for a given amount of time and forcibly unlocks it
+    /// if the timeout expires.
+    /// 
+    /// # Safety
+    /// 
+    /// The method is only safe to call when there are no active processes accessing the
+    /// mutex-protecred data.
+    pub unsafe fn check_recover(&mut self, timeout: Duration) {
+        if self.mutex.try_lock_for(timeout).is_none() {
+            lock_api::RawMutex::unlock(self.mutex.raw());
+        }
     }
 
     fn push_back_inner<A: Alloc>(&self, mut guard: MutexGuard<'_, VecDeque<T, A>>, item: T) {
@@ -223,7 +252,7 @@ impl<T> Inner<T> {
         debug_assert!(r.is_ok());
         if guard.len() == 1 {
             // This means we've pushed the first element
-            self.pushed.notify_one();
+            self.item_available.notify_one();
         }
     }
 
@@ -232,7 +261,7 @@ impl<T> Inner<T> {
         debug_assert!(r.is_ok());
         if guard.len() == 1 {
             // This means we've pushed the first element
-            self.pushed.notify_one();
+            self.item_available.notify_one();
         }
     }
 
@@ -240,7 +269,7 @@ impl<T> Inner<T> {
         if let Some(item) = queue.pop_back() {
             if queue.remaining_capacity() == 1 {
                 // This means we've just made a space for others to push.
-                self.popped.notify_one();
+                self.space_available.notify_one();
             }
             Some(item)
         } else {
@@ -252,7 +281,7 @@ impl<T> Inner<T> {
         if let Some(item) = queue.pop_front() {
             if queue.remaining_capacity() == 1 {
                 // This means we've just made a space for others to push.
-                self.popped.notify_one();
+                self.space_available.notify_one();
             }
             Some(item)
         } else {
@@ -265,13 +294,16 @@ impl<T> Inner<T> {
     pub fn push_back(&self, item: T) {
         let mut queue = self.mutex.lock();
         if queue.remaining_capacity() == 0 {
-            self.popped.wait(&mut queue);
+            self.space_available.wait(&mut queue);
         }
         self.push_back_inner(queue, item)
     }
 
     pub fn try_push_back(&self, item: T) -> Result<(), T> {
-        let queue = self.mutex.lock();
+        let queue = match self.mutex.try_lock() {
+            Some(guard) => guard,
+            None => return Err(item),
+        };
         if queue.remaining_capacity() == 0 {
             Err(item)
         } else {
@@ -286,9 +318,16 @@ impl<T> Inner<T> {
     }
 
     pub fn try_push_back_until(&self, item: T, until: Instant) -> Result<(), T> {
-        let mut queue = self.mutex.lock();
+        let mut queue = match self.mutex.try_lock_until(until) {
+            Some(guard) => guard,
+            None => return Err(item),
+        };
         if queue.remaining_capacity() == 0 {
-            if self.popped.wait_until(&mut queue, until).timed_out() {
+            if self
+                .space_available
+                .wait_until(&mut queue, until)
+                .timed_out()
+            {
                 return Err(item);
             }
         }
@@ -301,13 +340,16 @@ impl<T> Inner<T> {
     pub fn push_front(&self, item: T) {
         let mut queue = self.mutex.lock();
         if queue.remaining_capacity() == 0 {
-            self.popped.wait(&mut queue);
+            self.space_available.wait(&mut queue);
         }
         self.push_front_inner(queue, item)
     }
 
     pub fn try_push_front(&self, item: T) -> Result<(), T> {
-        let queue = self.mutex.lock();
+        let queue = match self.mutex.try_lock() {
+            Some(guard) => guard,
+            None => return Err(item),
+        };
         if queue.remaining_capacity() == 0 {
             Err(item)
         } else {
@@ -322,9 +364,16 @@ impl<T> Inner<T> {
     }
 
     pub fn try_push_front_until(&self, item: T, until: Instant) -> Result<(), T> {
-        let mut queue = self.mutex.lock();
+        let mut queue = match self.mutex.try_lock_until(until) {
+            Some(guard) => guard,
+            None => return Err(item),
+        };
         if queue.remaining_capacity() == 0 {
-            if self.popped.wait_until(&mut queue, until).timed_out() {
+            if self
+                .space_available
+                .wait_until(&mut queue, until)
+                .timed_out()
+            {
                 return Err(item);
             }
         }
@@ -337,14 +386,14 @@ impl<T> Inner<T> {
     pub fn pop_back(&self) -> T {
         let mut queue = self.mutex.lock();
         if queue.len() == 0 {
-            self.pushed.wait(&mut queue);
+            self.item_available.wait(&mut queue);
         }
 
         self.pop_back_inner(queue).expect("Error while popping")
     }
 
     pub fn try_pop_back(&self) -> Option<T> {
-        let queue = self.mutex.lock();
+        let queue = self.mutex.try_lock()?;
         self.pop_back_inner(queue)
     }
 
@@ -354,9 +403,13 @@ impl<T> Inner<T> {
     }
 
     pub fn try_pop_back_until(&self, until: Instant) -> Option<T> {
-        let mut queue = self.mutex.lock();
+        let mut queue = self.mutex.try_lock_until(until)?;
         if queue.len() == 0 {
-            if self.pushed.wait_until(&mut queue, until).timed_out() {
+            if self
+                .item_available
+                .wait_until(&mut queue, until)
+                .timed_out()
+            {
                 return None;
             }
         }
@@ -368,13 +421,13 @@ impl<T> Inner<T> {
     pub fn pop_front(&self) -> T {
         let mut queue = self.mutex.lock();
         if queue.len() == 0 {
-            self.pushed.wait(&mut queue);
+            self.item_available.wait(&mut queue);
         }
         self.pop_front_inner(queue).expect("Pop failed")
     }
 
     pub fn try_pop_front(&self) -> Option<T> {
-        let queue = self.mutex.lock();
+        let queue = self.mutex.try_lock()?;
         self.pop_front_inner(queue)
     }
 
@@ -384,9 +437,13 @@ impl<T> Inner<T> {
     }
 
     pub fn try_pop_front_until(&self, until: Instant) -> Option<T> {
-        let mut queue = self.mutex.lock();
+        let mut queue = self.mutex.try_lock_until(until)?;
         if queue.len() == 0 {
-            if self.pushed.wait_until(&mut queue, until).timed_out() {
+            if self
+                .item_available
+                .wait_until(&mut queue, until)
+                .timed_out()
+            {
                 return None;
             }
         }
