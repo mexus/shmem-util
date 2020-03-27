@@ -1,77 +1,91 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use rand::Rng;
-use shmem_utils::fixed_queue::{FixedQueue, ShmemSafe};
-use std::{
-    iter::repeat_with,
-    mem,
-    sync::atomic::{AtomicBool, Ordering},
-    sync::Arc,
-    thread,
-    time::Duration,
+use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
+use rand::{
+    distributions::{Distribution, Standard},
+    rngs::SmallRng,
+    Rng, SeedableRng,
 };
+use shmem_utils::{
+    channel::{Channel, Receiver, Sender},
+    shmem_safe::ShmemSafe,
+};
+use std::{thread, time::Duration};
 
-const SIZE: usize = 16;
-#[derive(Clone)]
-struct BigData([u8; SIZE]);
+macro_rules! declare_data_type {
+    ($name:ident, $size:expr) => {
+        #[derive(Clone)]
+        #[repr(transparent)]
+        struct $name([u8; $size]);
 
-unsafe impl ShmemSafe for BigData {}
+        impl Distribution<$name> for Standard {
+            fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> $name {
+                let mut array = [0; $size];
+                rng.fill(&mut array);
+                $name(array)
+            }
+        }
 
-fn generate() -> Vec<BigData> {
-    let mut rng = rand::thread_rng();
-    (0..10_240)
-        .map(|_| {
-            let mut array = [0; SIZE];
-            rng.fill(&mut array);
-            BigData(array)
-        })
-        .collect()
+        unsafe impl ShmemSafe for $name {}
+    };
 }
 
-fn looped(data: &[BigData]) -> impl Iterator<Item = BigData> + '_ {
-    let mut cnt = 0;
-    let len = data.len();
-    repeat_with(move || {
-        cnt = (cnt + 1) % len;
-        data[cnt].clone()
-    })
-}
+declare_data_type!(SmolData, 16);
+declare_data_type!(MediumData, 128);
+declare_data_type!(BigData, 1024);
 
 fn ping_pong_server<T: ShmemSafe>(
-    requests: &FixedQueue<T>,
-    responds: &FixedQueue<T>,
-    running: &Arc<AtomicBool>,
+    requests: Receiver<Request<T>>,
+    responds: Sender<Response<T>>,
 ) -> thread::JoinHandle<()>
 where
     T: Send + 'static,
 {
-    let requests = requests.clone();
-    let responds = responds.clone();
-    let running = Arc::clone(&running);
     thread::spawn(move || {
-        while running.load(Ordering::Relaxed) {
-            while let Some(item) = requests.try_pop_front_timeout(Duration::from_millis(100)) {
-                responds.push_back(item);
+        while let Some(Request(item)) = requests.receive() {
+            if responds.send(Response(item)).is_err() {
+                break;
             }
         }
     })
 }
 
-fn bench_length(b: &mut criterion::Bencher<'_>, data: &[BigData], queue_length: usize) {
-    let mut iter = looped(data);
-    let requests = FixedQueue::<BigData>::new(queue_length).unwrap();
-    let responds = FixedQueue::<BigData>::new(queue_length).unwrap();
+struct Request<T>(T);
+unsafe impl<T: ShmemSafe> ShmemSafe for Request<T> {}
 
-    let running = Arc::new(AtomicBool::new(true));
+struct Response<T>(T);
+unsafe impl<T: ShmemSafe> ShmemSafe for Response<T> {}
+
+fn bench<T>(b: &mut criterion::Bencher<'_>, queue_length: usize)
+where
+    T: ShmemSafe + Send + 'static,
+    Standard: Distribution<T>,
+{
+    let mut rng = SmallRng::seed_from_u64(1234);
+
+    let chan1 = Channel::<Request<T>>::new(queue_length).unwrap();
+    let chan2 = Channel::<Response<T>>::new(queue_length).unwrap();
+
+    let from_client = chan1.make_receiver();
+    let to_server = chan1.make_sender();
+
+    let from_server = chan2.make_receiver();
+    let to_client = chan2.make_sender();
 
     let servers: Vec<_> = (0..1)
-        .map(|_| ping_pong_server(&requests, &responds, &running))
+        .map(move |_| {
+            let from_client = from_client.clone();
+            let to_client = to_client.clone();
+            ping_pong_server(from_client, to_client)
+        })
         .collect();
 
-    b.iter(|| {
-        requests.push_back(iter.next().unwrap());
-        responds.pop_back()
-    });
-    running.store(false, Ordering::Relaxed);
+    b.iter_batched(
+        || rng.gen(),
+        move |item| {
+            assert!(to_server.send(Request(item)).is_ok());
+            assert!(from_server.receive().is_some());
+        },
+        BatchSize::SmallInput,
+    );
     servers.into_iter().for_each(|handle| {
         let _ = handle.join();
     });
@@ -79,19 +93,24 @@ fn bench_length(b: &mut criterion::Bencher<'_>, data: &[BigData], queue_length: 
 
 pub fn criterion_benchmark(c: &mut Criterion) {
     let mut group = c.benchmark_group("shmem queue");
-    group.throughput(Throughput::Bytes(mem::size_of::<BigData>() as u64));
-    for &capacity in &[1, 10, 100, 1000] {
-        let data = generate();
-        group.bench_function(format!("ping, cap = {}", capacity), |b| {
-            bench_length(b, &data, capacity)
-        });
-    }
+
+    const CAPACITY: usize = 2;
+
+    group.bench_function(format!("smol ping, cap = {}", CAPACITY), |b| {
+        bench::<SmolData>(b, CAPACITY)
+    });
+    group.bench_function(format!("medium ping, cap = {}", CAPACITY), |b| {
+        bench::<MediumData>(b, CAPACITY)
+    });
+    group.bench_function(format!("big ping, cap = {}", CAPACITY), |b| {
+        bench::<BigData>(b, CAPACITY)
+    });
     group.finish();
 }
 
 criterion_group! {
     name = benches;
-    config = Criterion::default().measurement_time(Duration::from_secs(30));
+    config = Criterion::default().measurement_time(Duration::from_secs(10));
     targets = criterion_benchmark
 }
 criterion_main!(benches);

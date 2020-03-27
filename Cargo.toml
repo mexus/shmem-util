@@ -1,6 +1,6 @@
 [package]
 name = "shmem-utils"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["mexus <gilaldpellaeon@gmail.com>"]
 edition = "2018"
 
@@ -16,12 +16,16 @@ lock_api = "0.3.3"
 
 [dev-dependencies]
 criterion = "0.3.1"
-rand = "0.7.3"
+rand = {version = "0.7.3", features = ["small_rng"]}
 
 [[bench]]
 name = "queue"
 harness = false
 
 [profile.release]
+codegen-units = 1
+lto = "thin"
+
+[profile.bench]
 codegen-units = 1
 lto = "thin"
