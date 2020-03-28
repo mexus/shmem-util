@@ -6,7 +6,7 @@ use rand::{
 };
 use shmem_utils::{
     channel::{Channel, Receiver, Sender},
-    shmem_safe::ShmemSafe,
+    ShmemSafe,
 };
 use std::{thread, time::Duration};
 

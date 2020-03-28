@@ -1,6 +1,6 @@
 [package]
 name = "shmem-utils"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["mexus <gilaldpellaeon@gmail.com>"]
 edition = "2018"
 
@@ -17,6 +17,7 @@ lock_api = "0.3.3"
 [dev-dependencies]
 criterion = "0.3.1"
 rand = {version = "0.7.3", features = ["small_rng"]}
+env_logger = "0.7.1"
 
 [[bench]]
 name = "queue"

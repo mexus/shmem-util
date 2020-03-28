@@ -4,4 +4,5 @@ pub mod channel;
 pub mod memmap;
 pub mod pagesize;
 
-pub mod shmem_safe;
+mod shmem_safe;
+pub use shmem_safe::ShmemSafe;
