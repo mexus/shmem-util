@@ -1,32 +1,67 @@
 use crate::{allocator::ShmemAlloc, memmap::MemmapAlloc};
-use alloc_collections::{deque::VecDeque, IndexMap, Vec};
+use alloc_collections::{boxes::CustomBox, deque::VecDeque, IndexMap, Vec};
+use core::sync::atomic;
 
 /// Marker trait for types that are safe to be transmitted between processes.
 pub unsafe trait ShmemSafe {}
 
+// Unsigned types:
 unsafe impl ShmemSafe for u8 {}
+unsafe impl ShmemSafe for atomic::AtomicU8 {}
+
 unsafe impl ShmemSafe for u16 {}
+unsafe impl ShmemSafe for atomic::AtomicU16 {}
+
 unsafe impl ShmemSafe for u32 {}
+unsafe impl ShmemSafe for atomic::AtomicU32 {}
+
 unsafe impl ShmemSafe for u64 {}
+unsafe impl ShmemSafe for atomic::AtomicU64 {}
+
 unsafe impl ShmemSafe for u128 {}
+// No AtomicU128
+
 unsafe impl ShmemSafe for usize {}
+unsafe impl ShmemSafe for atomic::AtomicUsize {}
 
+// Signed types:
 unsafe impl ShmemSafe for i8 {}
-unsafe impl ShmemSafe for i16 {}
-unsafe impl ShmemSafe for i32 {}
-unsafe impl ShmemSafe for i64 {}
-unsafe impl ShmemSafe for i128 {}
-unsafe impl ShmemSafe for isize {}
+unsafe impl ShmemSafe for atomic::AtomicI8 {}
 
+unsafe impl ShmemSafe for i16 {}
+unsafe impl ShmemSafe for atomic::AtomicI16 {}
+
+unsafe impl ShmemSafe for i32 {}
+unsafe impl ShmemSafe for atomic::AtomicI32 {}
+
+unsafe impl ShmemSafe for i64 {}
+unsafe impl ShmemSafe for atomic::AtomicI64 {}
+
+unsafe impl ShmemSafe for i128 {}
+// No AtomicI128
+
+unsafe impl ShmemSafe for isize {}
+unsafe impl ShmemSafe for atomic::AtomicIsize {}
+
+// Elementary types.
 unsafe impl ShmemSafe for char {}
+unsafe impl ShmemSafe for bool {}
+unsafe impl ShmemSafe for atomic::AtomicBool {}
+
+// Pointers.
+unsafe impl<T: ShmemSafe> ShmemSafe for *mut T {}
+unsafe impl<T: ShmemSafe> ShmemSafe for *const T {}
+unsafe impl<T: ShmemSafe> ShmemSafe for atomic::AtomicPtr<T> {}
 
 unsafe impl<T: ShmemSafe> ShmemSafe for VecDeque<T, MemmapAlloc> {}
 unsafe impl<T: ShmemSafe> ShmemSafe for Vec<T, MemmapAlloc> {}
 unsafe impl<T: ShmemSafe> ShmemSafe for IndexMap<T, MemmapAlloc> {}
+unsafe impl<T: ShmemSafe> ShmemSafe for CustomBox<T, MemmapAlloc> {}
 
 unsafe impl<T: ShmemSafe> ShmemSafe for VecDeque<T, ShmemAlloc> {}
 unsafe impl<T: ShmemSafe> ShmemSafe for Vec<T, ShmemAlloc> {}
 unsafe impl<T: ShmemSafe> ShmemSafe for IndexMap<T, ShmemAlloc> {}
+unsafe impl<T: ShmemSafe> ShmemSafe for CustomBox<T, ShmemAlloc> {}
 
 macro_rules! impl_array {
     ($($size:expr),* $(,)?) => {

@@ -165,41 +165,41 @@ unsafe impl Alloc for ShmemAlloc {
 
 #[cfg(test)]
 mod test {
-    use super::*;
-    use core::time::Duration;
-    use nix::unistd::{fork, ForkResult};
-    use std::thread;
+    // use super::*;
+    // use core::time::Duration;
+    // use nix::unistd::{fork, ForkResult};
+    // use std::thread;
 
-    #[test]
-    fn check_fork() {
-        type Vec = alloc_collections::Vec<usize, ShmemAlloc>;
+    // #[test]
+    // fn check_fork() {
+    //     type Vec = alloc_collections::Vec<usize, ShmemAlloc>;
 
-        let data_allocator = ShmemAlloc::new::<usize>(1024).unwrap();
-        let vec_allocator = ShmemAlloc::new::<Mutex<Vec>>(2).unwrap();
+    //     let data_allocator = ShmemAlloc::new::<usize>(1024).unwrap();
+    //     let vec_allocator = ShmemAlloc::new::<Mutex<Vec>>(2).unwrap();
 
-        let vector1 = Mutex::new(Vec::new_in(data_allocator.clone()));
-        let vector2 = Mutex::new(Vec::new_in(data_allocator));
+    //     let vector1 = Mutex::new(Vec::new_in(data_allocator.clone()));
+    //     let vector2 = Mutex::new(Vec::new_in(data_allocator));
 
-        let vector1 = CustomBox::new_in(vector1, vec_allocator.clone()).unwrap();
-        let vector2 = CustomBox::new_in(vector2, vec_allocator).unwrap();
+    //     let vector1 = CustomBox::new_in(vector1, vec_allocator.clone()).unwrap();
+    //     let vector2 = CustomBox::new_in(vector2, vec_allocator).unwrap();
 
-        match fork().unwrap() {
-            ForkResult::Parent { .. } => {
-                vector1.lock().push(1413).unwrap();
-                vector2.lock().push(2594).unwrap();
-                thread::sleep(Duration::from_millis(200));
+    //     match fork().unwrap() {
+    //         ForkResult::Parent { .. } => {
+    //             vector1.lock().push(1413).unwrap();
+    //             vector2.lock().push(2594).unwrap();
+    //             thread::sleep(Duration::from_millis(200));
 
-                assert_eq!(vector1.lock().pop(), Some(1413 + 1));
-                assert_eq!(vector2.lock().pop(), Some(2594 + 1));
-            }
-            ForkResult::Child => {
-                thread::sleep(Duration::from_millis(100));
-                let first = vector1.lock().pop().unwrap();
-                let second = vector2.lock().pop().unwrap();
+    //             assert_eq!(vector1.lock().pop(), Some(1413 + 1));
+    //             assert_eq!(vector2.lock().pop(), Some(2594 + 1));
+    //         }
+    //         ForkResult::Child => {
+    //             thread::sleep(Duration::from_millis(100));
+    //             let first = vector1.lock().pop().unwrap();
+    //             let second = vector2.lock().pop().unwrap();
 
-                vector1.lock().push(first + 1).unwrap();
-                vector2.lock().push(second + 1).unwrap();
-            }
-        }
-    }
+    //             vector1.lock().push(first + 1).unwrap();
+    //             vector2.lock().push(second + 1).unwrap();
+    //         }
+    //     }
+    // }
 }

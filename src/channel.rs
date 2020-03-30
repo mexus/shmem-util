@@ -1,16 +1,16 @@
-use crate::{memmap::MemmapAlloc, shmem_safe::ShmemSafe};
+use crate::{
+    condvar::Condvar,
+    memmap::MemmapAlloc,
+    mutex::{Mutex, MutexGuard},
+    shmem_safe::ShmemSafe,
+};
 use alloc_collections::{boxes::CustomBox, deque::VecDeque, raw_vec};
 use nix::unistd::Pid;
-use parking_lot::{Condvar, Mutex, MutexGuard};
 use snafu::Snafu;
 use std::{
-    alloc::Layout,
     mem::ManuallyDrop,
     ptr::NonNull,
-    sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
 
@@ -72,14 +72,17 @@ impl PerProcessReferences {
 /// and call `Channel::destroy(..)` method.
 pub struct Channel<T> {
     inner: NonNull<Inner<T>>,
-    references: Arc<PerProcessReferences>,
+
+    /// Heap-allocated references.
+    references: NonNull<PerProcessReferences>,
+
     original_pid: Pid,
 }
 
 impl<T> Clone for Channel<T> {
     fn clone(&self) -> Self {
-        let references = Arc::clone(&self.references);
-        references.increase();
+        let references = self.references;
+        unsafe { references.as_ref() }.increase();
         Channel {
             inner: self.inner,
             references,
@@ -95,6 +98,7 @@ impl<T: ShmemSafe> Channel<T> {
     /// Creates an queue with a given capacity in shared memory.
     pub fn new(capacity: usize) -> Result<Self, raw_vec::Error> {
         let queue = VecDeque::<T, _>::with_capacity_in(capacity, MemmapAlloc)?;
+        log::debug!("Queue allocated");
         let inner = Inner {
             mutex: Mutex::new(queue),
             receivers: AtomicUsize::new(0),
@@ -105,11 +109,16 @@ impl<T: ShmemSafe> Channel<T> {
         };
         let inner = CustomBox::new_in(inner, MemmapAlloc)
             .map_err(|e| raw_vec::Error::Allocation { source: e })?;
-        let (inner, _layout, _allocator) = inner.into_raw_parts();
+        log::debug!("\"Inner\" moved to shared memory");
+        let (inner, _allocator) = inner.into_raw_parts();
+
+        // Heap-allocated references.
+        let references = Box::new(PerProcessReferences::new());
+        let references = unsafe { NonNull::new_unchecked(Box::into_raw(references)) };
 
         Ok(Channel {
-            inner: inner.cast(),
-            references: Arc::new(PerProcessReferences::new()),
+            inner,
+            references,
             original_pid: Pid::this(),
         })
     }
@@ -155,7 +164,8 @@ impl<T> Drop for Channel<T> {
         let inner = unsafe { self.inner.as_ref() };
         let current_pid = Pid::this();
 
-        if let DecreaseResult::MoveAlong = self.references.decrease(current_pid) {
+        if let DecreaseResult::MoveAlong = unsafe { self.references.as_ref() }.decrease(current_pid)
+        {
             // Not the last reference.
             return;
         }
@@ -163,7 +173,6 @@ impl<T> Drop for Channel<T> {
         if self.original_pid != current_pid {
             // This it not an owner of the queue.
             // No-op.
-            log::debug!("Not an owner");
             return;
         }
 
@@ -172,15 +181,18 @@ impl<T> Drop for Channel<T> {
 
         let receivers = inner.receivers.swap(0, Ordering::SeqCst);
         let senders = inner.senders.swap(0, Ordering::SeqCst);
+        log::debug!("{} receivers remain, {} senders remain", receivers, senders);
         if receivers != 0 {
             log::warn!("There are {} receivers alive", receivers);
-            // Let's notify all the receivers that might be blocked on waiting for the mutex.
-            inner.space_maybe_available.notify_all();
+            // Let's notify all the receivers that might be blocked on waiting for data to become
+            // available.
+            inner.item_maybe_available.broadcast();
         }
         if senders != 0 {
             log::warn!("There are {} senders alive", senders);
-            // Let's notify all the senders that might be blocked on waiting for the mutex.
-            inner.item_maybe_available.notify_all();
+            // Let's notify all the senders that might be blocked on waiting for space to become
+            // available.
+            inner.space_maybe_available.broadcast();
         }
 
         // Let's wait until a probable mutex-holder releases the lock.
@@ -192,13 +204,11 @@ impl<T> Drop for Channel<T> {
         }
         // Here the guard is released, but we are sure we are the only ones who's referencing the
         // `Inner` pointer, because we've set both `senders` and `receivers` atomic to zeroes.
-        let _inner = unsafe {
-            CustomBox::<Inner<T>, _>::from_raw_parts(
-                self.inner.cast(),
-                Layout::new::<Inner<T>>(),
-                crate::memmap::MemmapAlloc,
-            )
+        let inner = unsafe {
+            CustomBox::<Inner<T>, _>::from_raw_parts(self.inner, crate::memmap::MemmapAlloc)
         };
+        drop(inner);
+        log::debug!("Dropped the inner queue");
     }
 }
 
@@ -257,7 +267,7 @@ impl<T> Drop for Sender<T> {
             log::debug!("Last sender destroyed; sending item_maybe_available event");
             unsafe { self.channel.inner.as_ref() }
                 .item_maybe_available
-                .notify_all();
+                .broadcast();
         }
     }
 }
@@ -323,7 +333,7 @@ impl<T> Receiver<T> {
     #[inline(always)]
     pub fn receive(&self) -> Option<T> {
         let inner = unsafe { self.channel.inner.as_ref() };
-        inner.try_receive()
+        inner.receive()
     }
 
     /// Waits for a message to appear.
@@ -362,7 +372,7 @@ impl<T> Drop for Receiver<T> {
             log::debug!("Last receiver destroyed; sending space_maybe_available event");
             unsafe { self.channel.inner.as_ref() }
                 .space_maybe_available
-                .notify_all();
+                .broadcast();
         }
     }
 }
@@ -396,18 +406,22 @@ impl<T> Inner<T> {
     #[inline(always)]
     fn push(
         &self,
-        guard: &mut MutexGuard<VecDeque<T, MemmapAlloc>>,
+        mut guard: MutexGuard<VecDeque<T, MemmapAlloc>>,
         item: T,
     ) -> Result<(), raw_vec::Error> {
         guard.push_back(item)?;
-        self.item_maybe_available.notify_one();
+        drop(guard);
+        log::debug!("Notifying that an item is available to be read");
+        self.item_maybe_available.signal();
+        log::debug!("Notifying {:p}", &self.item_maybe_available);
+
         Ok(())
     }
 
     #[inline(always)]
     fn pop(&self, guard: &mut MutexGuard<VecDeque<T, MemmapAlloc>>) -> Option<T> {
         let item = guard.pop_front()?;
-        self.space_maybe_available.notify_one();
+        self.space_maybe_available.signal();
         Some(item)
     }
 
@@ -426,21 +440,26 @@ impl<T> Inner<T> {
             None => return Err(WaitingError::TimeoutReached),
             Some(guard) => guard,
         };
-        while guard.is_empty() {
-            if self
-                .item_maybe_available
-                .wait_until(&mut guard, until)
-                .timed_out()
-            {
-                return Err(WaitingError::TimeoutReached);
-            }
+        // while guard.is_empty() {
+        log::debug!("Locking on condvar {:p}", &self.item_maybe_available);
+        if self
+            .item_maybe_available
+            .wait_until(&mut guard, until, |queue| {
+                !queue.is_empty() || self.dropping.load(Ordering::SeqCst)
+            })
+            .is_err()
+        {
+            log::debug!("Condvar {:p} reported timeout", &self.item_maybe_available);
+            return Err(WaitingError::TimeoutReached);
+        } else {
+            log::debug!("Condvar {:p} reported ready", &self.item_maybe_available);
         }
 
         Ok(())
     }
 
-    /// Tries to receive an item.
-    pub fn try_receive(&self) -> Option<T> {
+    /// Tries to receive an item [forerver, or until no senders are available].
+    pub fn receive(&self) -> Option<T> {
         const LOCK_TIMEOUT: Duration = Duration::from_secs(1);
         let mut guard = loop {
             // Let's check that the main process haven't started destruction process.
@@ -456,18 +475,12 @@ impl<T> Inner<T> {
             };
         };
         log::debug!("Lock obtained");
-        loop {
-            if let Some(item) = self.pop(&mut guard) {
-                return Some(item);
-            } else if self.senders.load(Ordering::SeqCst) == 0
+        self.item_maybe_available.wait(&mut guard, |queue| {
+            !queue.is_empty()
+                || self.senders.load(Ordering::SeqCst) == 0
                 || self.dropping.load(Ordering::SeqCst)
-            {
-                return None;
-            } else {
-                log::debug!("No items whatsoever");
-                self.item_maybe_available.wait(&mut guard)
-            }
-        }
+        });
+        self.pop(&mut guard)
     }
 
     /// Tries to receive an item until a timeout is reached.
@@ -480,20 +493,20 @@ impl<T> Inner<T> {
             None => return Err(TryReceiveError::TimedOut),
             Some(guard) => guard,
         };
-        loop {
-            if let Some(item) = self.pop(&mut guard) {
-                return Ok(item);
-            } else if self.senders.load(Ordering::SeqCst) == 0
-                || self.dropping.load(Ordering::SeqCst)
-            {
-                return Err(TryReceiveError::NoSenders);
-            } else if self
-                .item_maybe_available
-                .wait_until(&mut guard, until)
-                .timed_out()
-            {
-                return Err(TryReceiveError::TimedOut);
-            }
+        if self
+            .item_maybe_available
+            .wait_until(&mut guard, until, |queue| {
+                !queue.is_empty()
+                    || self.senders.load(Ordering::SeqCst) == 0
+                    || self.dropping.load(Ordering::SeqCst)
+            })
+            .is_err()
+        {
+            Err(TryReceiveError::TimedOut)
+        } else if self.senders.load(Ordering::SeqCst) == 0 || self.dropping.load(Ordering::SeqCst) {
+            Err(TryReceiveError::NoSenders)
+        } else {
+            Ok(self.pop(&mut guard).expect("There should be something!!"))
         }
     }
 
@@ -516,6 +529,7 @@ impl<T> Inner<T> {
         }
     }
 
+    /// Tries to send an item [forever, or until there are no more receivers].
     pub fn try_send(&self, item: T) -> Result<(), T> {
         const LOCK_TIMEOUT: Duration = Duration::from_secs(1);
         let mut guard = loop {
@@ -533,15 +547,15 @@ impl<T> Inner<T> {
         };
         log::debug!("Lock obtained");
 
-        while guard.remaining_capacity() == 0 {
-            log::debug!("Capacity is still zero");
-            if self.receivers.load(Ordering::SeqCst) == 0 || self.dropping.load(Ordering::SeqCst) {
-                return Err(item);
-            } else {
-                self.space_maybe_available.wait(&mut guard);
-            }
+        self.space_maybe_available.wait(&mut guard, |queue| {
+            queue.remaining_capacity() != 0
+                || self.receivers.load(Ordering::SeqCst) == 0
+                || self.dropping.load(Ordering::SeqCst)
+        });
+        if self.receivers.load(Ordering::SeqCst) == 0 || self.dropping.load(Ordering::SeqCst) {
+            return Err(item);
         }
-        self.push(&mut guard, item).expect("Shouldn't fail");
+        self.push(guard, item).expect("Shouldn't fail");
         Ok(())
     }
 
@@ -555,28 +569,33 @@ impl<T> Inner<T> {
             None => return Err(TrySendError::TimedOut(item)),
             Some(guard) => guard,
         };
-        while guard.remaining_capacity() == 0 {
-            if self.receivers.load(Ordering::SeqCst) == 0 || self.dropping.load(Ordering::SeqCst) {
-                return Err(TrySendError::NoReceivers(item));
-            } else if self
-                .space_maybe_available
-                .wait_until(&mut guard, until)
-                .timed_out()
-            {
-                return Err(TrySendError::TimedOut(item));
-            }
+
+        if self
+            .space_maybe_available
+            .wait_until(&mut guard, until, |queue| {
+                queue.remaining_capacity() != 0
+                    || self.receivers.load(Ordering::SeqCst) == 0
+                    || self.dropping.load(Ordering::SeqCst)
+            })
+            .is_err()
+        {
+            return Err(TrySendError::TimedOut(item));
         }
-        self.push(&mut guard, item).expect("Shouldn't fail");
+
+        if self.receivers.load(Ordering::SeqCst) == 0 || self.dropping.load(Ordering::SeqCst) {
+            return Err(TrySendError::NoReceivers(item));
+        }
+        self.push(guard, item).expect("Shouldn't fail");
         Ok(())
     }
 
-    /// Tries to send an item once.
+    /// Tries to send an item without blocking.
     pub fn try_send_once(&self, item: T) -> Result<(), TrySendError<T>> {
         // Let's check that the main process haven't started destruction process.
         if self.dropping.load(Ordering::SeqCst) {
             return Err(TrySendError::NoReceivers(item));
         }
-        let mut guard = match self.mutex.try_lock() {
+        let guard = match self.mutex.try_lock() {
             Some(guard) => guard,
             None => return Err(TrySendError::TimedOut(item)),
         };
@@ -586,7 +605,7 @@ impl<T> Inner<T> {
         {
             Err(TrySendError::NoReceivers(item))
         } else {
-            self.push(&mut guard, item).expect("Shouldn't fail");
+            self.push(guard, item).expect("Shouldn't fail");
             Ok(())
         }
     }

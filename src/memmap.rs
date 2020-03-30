@@ -26,7 +26,23 @@ unsafe impl Alloc for MemmapAlloc {
         )
         .map(NonNull::new)
         {
-            Ok(Some(raw_ptr)) => Ok(raw_ptr.cast()),
+            Ok(Some(raw_ptr)) => {
+                if raw_ptr.as_ptr() as usize % layout.align() != 0 {
+                    log::debug!(
+                        "Mmap returned unsuitably aligned memory at {:p}, requested layout {:?}",
+                        raw_ptr,
+                        layout
+                    );
+                    AllocationError { layout }.fail()
+                } else {
+                    log::debug!(
+                        "Mapped memory region at {:p} with layout {:?}",
+                        raw_ptr,
+                        layout
+                    );
+                    Ok(raw_ptr.cast())
+                }
+            }
             Ok(None) => {
                 log::error!("mmap returned null pointer");
                 AllocationError { layout }.fail()
@@ -41,6 +57,12 @@ unsafe impl Alloc for MemmapAlloc {
     unsafe fn dealloc(&mut self, ptr: NonNull<u8>, layout: Layout) {
         if let Err(e) = munmap(ptr.as_ptr().cast(), layout.size()) {
             log::error!("munmap at {:p}, layout {:?} failed: {}", ptr, layout, e);
+        } else {
+            log::debug!(
+                "Unmapped memory region at {:p} with layout {:?}",
+                ptr,
+                layout
+            );
         }
     }
 }
