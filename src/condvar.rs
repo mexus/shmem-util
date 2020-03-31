@@ -1,5 +1,5 @@
 use crate::{
-    allocator::ShmemAlloc, memmap::MemmapAlloc, mutex::MutexGuard, strerror, time::Monotonic,
+    allocator::ShmemAlloc, memmap::MemmapAlloc, mutex::MutexGuard, strerror, time::UnixClock,
     ShmemSafe,
 };
 use alloc_collections::boxes::CustomBox;
@@ -151,7 +151,7 @@ impl Condvar {
     where
         F: FnMut(&T) -> bool,
     {
-        let now = Monotonic::now();
+        let now = UnixClock::monitonic();
         let until = now.add(timeout);
 
         self.wait_until_internal(guard, until, is_ready)
@@ -171,7 +171,7 @@ impl Condvar {
     where
         F: FnMut(&T) -> bool,
     {
-        let until = Monotonic::from(until);
+        let until = UnixClock::from(until);
         self.wait_until_internal(guard, until, is_ready)
     }
 
@@ -183,7 +183,7 @@ impl Condvar {
     fn wait_until_internal<'a, T, F>(
         &self,
         guard: &mut MutexGuard<'a, T>,
-        until: Monotonic,
+        until: UnixClock,
         mut is_ready: F,
     ) -> Result<(), ()>
     where

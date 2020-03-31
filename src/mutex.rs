@@ -1,5 +1,5 @@
 use crate::strerror;
-use crate::{allocator::ShmemAlloc, memmap::MemmapAlloc, time::Monotonic, ShmemSafe};
+use crate::{allocator::ShmemAlloc, memmap::MemmapAlloc, time::UnixClock, ShmemSafe};
 use alloc_collections::boxes::CustomBox;
 use nix::unistd::Pid;
 use std::{
@@ -120,6 +120,7 @@ impl<T> Mutex<T> {
             }
             mutex.assume_init()
         };
+
         Self {
             data: ManuallyDrop::new(UnsafeCell::new(data)),
             raw_mutex: UnsafeCell::new(mutex),
@@ -182,7 +183,7 @@ impl<T> Mutex<T> {
     ///
     /// MAKE SURE that no MutexGuard is alive (i.e. not dropped) prior to call `fork()`!.
     pub fn try_lock_for(&self, duration: Duration) -> Option<MutexGuard<'_, T>> {
-        let until = Monotonic::now().add(duration);
+        let until = UnixClock::realtime().add(duration);
         self.try_lock_until_internal(until)
     }
 
@@ -194,12 +195,12 @@ impl<T> Mutex<T> {
     ///
     /// MAKE SURE that no MutexGuard is alive (i.e. not dropped) prior to call `fork()`!.
     pub fn try_lock_until(&self, until: Instant) -> Option<MutexGuard<'_, T>> {
-        let until = Monotonic::from(until);
-        self.try_lock_until_internal(Monotonic::from(until))
+        let until = UnixClock::from(until);
+        self.try_lock_until_internal(UnixClock::from(until))
     }
 
     /// Tries to obtain a lock within a given timeout.
-    fn try_lock_until_internal(&self, until: Monotonic) -> Option<MutexGuard<'_, T>> {
+    fn try_lock_until_internal(&self, until: UnixClock) -> Option<MutexGuard<'_, T>> {
         let ptr = self.raw_mutex.get();
         unsafe {
             let errno = libc::pthread_mutex_timedlock(ptr, until.as_ptr());
@@ -326,6 +327,36 @@ mod test {
             }
             ForkResult::Child => {
                 let mut guard = mutex.lock();
+                *guard += 1;
+            }
+        }
+    }
+
+    #[test]
+    fn check_wait_until() {
+        init_logging();
+
+        let mutex = CustomBox::new_in(Mutex::new(0usize), MemmapAlloc).unwrap();
+
+        match fork().unwrap() {
+            ForkResult::Parent { child } => {
+                let guard = mutex.lock();
+                assert_eq!(*guard, 0);
+
+                thread::sleep(Duration::from_millis(200));
+                drop(guard);
+
+                waitpid(child, None).unwrap();
+
+                let guard = mutex.lock();
+                assert_eq!(*guard, 1);
+            }
+            ForkResult::Child => {
+                thread::sleep(Duration::from_millis(20));
+                assert!(mutex.try_lock_for(Duration::from_nanos(1)).is_none());
+                let mut guard = mutex
+                    .try_lock_for(Duration::from_secs(1))
+                    .expect("Unable to obtain a lock");
                 *guard += 1;
             }
         }
