@@ -28,14 +28,14 @@ unsafe impl Alloc for MemmapAlloc {
         {
             Ok(Some(raw_ptr)) => {
                 if raw_ptr.as_ptr() as usize % layout.align() != 0 {
-                    log::debug!(
+                    log::error!(
                         "Mmap returned unsuitably aligned memory at {:p}, requested layout {:?}",
                         raw_ptr,
                         layout
                     );
                     AllocationError { layout }.fail()
                 } else {
-                    log::debug!(
+                    log::trace!(
                         "Mapped memory region at {:p} with layout {:?}",
                         raw_ptr,
                         layout
@@ -58,7 +58,7 @@ unsafe impl Alloc for MemmapAlloc {
         if let Err(e) = munmap(ptr.as_ptr().cast(), layout.size()) {
             log::error!("munmap at {:p}, layout {:?} failed: {}", ptr, layout, e);
         } else {
-            log::debug!(
+            log::trace!(
                 "Unmapped memory region at {:p} with layout {:?}",
                 ptr,
                 layout

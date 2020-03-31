@@ -88,8 +88,6 @@ impl<'a, T> Drop for MutexGuard<'a, T> {
             let errno = libc::pthread_mutex_unlock(self.raw_mutex);
             if errno != 0 {
                 log::error!("Unable to unlock mutex: {}", strerror(errno));
-            } else {
-                log::debug!("Mutex unlocked");
             }
         }
     }
@@ -141,8 +139,6 @@ impl<T> Mutex<T> {
             let errno = libc::pthread_mutex_lock(ptr);
             if errno != 0 {
                 panic!("Unable to lock mutex: {}", strerror(errno));
-            } else {
-                log::debug!("Mutex locked");
             }
         }
         MutexGuard {
@@ -228,12 +224,12 @@ impl<T> Drop for Mutex<T> {
             log::error!("Unable to destroy mutex: {}", strerror(errno));
             return;
         } else {
-            log::debug!("Mutex destroyed.");
+            log::trace!("Mutex destroyed.");
         }
         unsafe {
             ManuallyDrop::drop(&mut self.data);
         }
-        log::debug!("Associated data dropped.");
+        log::trace!("Associated data dropped.");
     }
 }
 
@@ -253,7 +249,7 @@ mod test {
     impl<'a> Drop for Check<'a> {
         fn drop(&mut self) {
             *self.0 += 1;
-            log::debug!("Dropping check ({:?})", *self.0);
+            log::info!("Dropping check ({:?})", *self.0);
         }
     }
 

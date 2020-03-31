@@ -98,7 +98,7 @@ impl<T: ShmemSafe> Channel<T> {
     /// Creates an queue with a given capacity in shared memory.
     pub fn new(capacity: usize) -> Result<Self, raw_vec::Error> {
         let queue = VecDeque::<T, _>::with_capacity_in(capacity, MemmapAlloc)?;
-        log::debug!("Queue allocated");
+        log::trace!("Queue allocated");
         let inner = Inner {
             mutex: Mutex::new(queue),
             receivers: AtomicUsize::new(0),
@@ -109,7 +109,7 @@ impl<T: ShmemSafe> Channel<T> {
         };
         let inner = CustomBox::new_in(inner, MemmapAlloc)
             .map_err(|e| raw_vec::Error::Allocation { source: e })?;
-        log::debug!("\"Inner\" moved to shared memory");
+        log::trace!("\"Inner\" moved to shared memory");
         let (inner, _allocator) = inner.into_raw_parts();
 
         // Heap-allocated references.
@@ -176,12 +176,12 @@ impl<T> Drop for Channel<T> {
             return;
         }
 
-        log::debug!("Dropping channel");
+        log::trace!("Dropping channel");
         inner.dropping.store(true, Ordering::SeqCst);
 
         let receivers = inner.receivers.swap(0, Ordering::SeqCst);
         let senders = inner.senders.swap(0, Ordering::SeqCst);
-        log::debug!("{} receivers remain, {} senders remain", receivers, senders);
+        log::trace!("{} receivers remain, {} senders remain", receivers, senders);
         if receivers != 0 {
             log::warn!("There are {} receivers alive", receivers);
             // Let's notify all the receivers that might be blocked on waiting for data to become
@@ -208,7 +208,7 @@ impl<T> Drop for Channel<T> {
             CustomBox::<Inner<T>, _>::from_raw_parts(self.inner, crate::memmap::MemmapAlloc)
         };
         drop(inner);
-        log::debug!("Dropped the inner queue");
+        log::trace!("Dropped the inner queue");
     }
 }
 
@@ -264,7 +264,7 @@ impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
         let senders = &unsafe { self.channel.inner.as_ref() }.senders;
         if atomic_checked_sub(senders) == 0 {
-            log::debug!("Last sender destroyed; sending item_maybe_available event");
+            log::trace!("Last sender destroyed; sending item_maybe_available event");
             unsafe { self.channel.inner.as_ref() }
                 .item_maybe_available
                 .broadcast();
@@ -369,7 +369,7 @@ impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
         let receivers = &unsafe { self.channel.inner.as_ref() }.receivers;
         if atomic_checked_sub(receivers) == 0 {
-            log::debug!("Last receiver destroyed; sending space_maybe_available event");
+            log::trace!("Last receiver destroyed; sending space_maybe_available event");
             unsafe { self.channel.inner.as_ref() }
                 .space_maybe_available
                 .broadcast();
@@ -410,10 +410,8 @@ impl<T> Inner<T> {
         item: T,
     ) -> Result<(), raw_vec::Error> {
         guard.push_back(item)?;
-        drop(guard);
-        log::debug!("Notifying that an item is available to be read");
         self.item_maybe_available.signal();
-        log::debug!("Notifying {:p}", &self.item_maybe_available);
+        drop(guard);
 
         Ok(())
     }
@@ -440,8 +438,6 @@ impl<T> Inner<T> {
             None => return Err(WaitingError::TimeoutReached),
             Some(guard) => guard,
         };
-        // while guard.is_empty() {
-        log::debug!("Locking on condvar {:p}", &self.item_maybe_available);
         if self
             .item_maybe_available
             .wait_until(&mut guard, until, |queue| {
@@ -449,10 +445,7 @@ impl<T> Inner<T> {
             })
             .is_err()
         {
-            log::debug!("Condvar {:p} reported timeout", &self.item_maybe_available);
             return Err(WaitingError::TimeoutReached);
-        } else {
-            log::debug!("Condvar {:p} reported ready", &self.item_maybe_available);
         }
 
         Ok(())
@@ -474,7 +467,6 @@ impl<T> Inner<T> {
                 Some(guard) => break guard,
             };
         };
-        log::debug!("Lock obtained");
         self.item_maybe_available.wait(&mut guard, |queue| {
             !queue.is_empty()
                 || self.senders.load(Ordering::SeqCst) == 0
@@ -545,7 +537,6 @@ impl<T> Inner<T> {
                 Some(guard) => break guard,
             };
         };
-        log::debug!("Lock obtained");
 
         self.space_maybe_available.wait(&mut guard, |queue| {
             queue.remaining_capacity() != 0

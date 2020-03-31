@@ -130,8 +130,6 @@ impl Condvar {
                         "Waiting on conditional variable failed: {}",
                         strerror(errno)
                     );
-                } else {
-                    log::debug!("Mutex guard re-locked");
                 }
             }
         }
@@ -254,10 +252,10 @@ mod test {
             // Child thread.
             s.spawn(|_| {
                 let mut guard = mutex.lock();
-                log::debug!("Waiting for signal");
+                log::info!("Waiting for signal");
                 condvar.wait(&mut guard, |value| *value == 1);
                 *guard += 1;
-                log::debug!("Exiting child thread");
+                log::info!("Exiting child thread");
             });
 
             // Main thread.
@@ -279,7 +277,7 @@ mod test {
         })
         .unwrap();
         drop(condvar);
-        log::debug!("Dropping mutex");
+        log::info!("Dropping mutex");
         drop(mutex);
     }
 
@@ -302,16 +300,16 @@ mod test {
                 **guard += 1;
                 drop(guard);
                 var.broadcast();
-                log::debug!("[parent] signal sent!");
+                log::info!("[parent] signal sent!");
 
                 waitpid(child, None).unwrap();
                 assert_eq!(**mutex.lock(), 2);
             }
             ForkResult::Child => {
                 let mut guard = mutex.lock();
-                log::debug!("[child] Lock acquired");
+                log::info!("[child] Lock acquired");
                 var.wait(&mut guard, |value| **value == 1);
-                log::debug!("[child] Notification received");
+                log::info!("[child] Notification received");
                 **guard += 1;
             }
         }
