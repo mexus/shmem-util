@@ -1,13 +1,17 @@
 use alloc_collections::boxes::CustomBox;
-use nix::unistd::{fork, ForkResult};
+use nix::{
+    sys::wait::waitpid,
+    unistd::{fork, ForkResult},
+};
 use parking_lot::{Condvar, Mutex};
-use shmem_utils::memmap::MemmapAlloc;
+use shmem_utils::allocator::ShmemAlloc;
 use std::{thread, time::Duration};
 
 fn main() {
-    let condvar = CustomBox::new_in((Condvar::new(), Mutex::new(())), MemmapAlloc).unwrap();
+    let allocator = ShmemAlloc::new(1024).unwrap();
+    let condvar = CustomBox::new_in((Condvar::new(), Mutex::new(())), allocator).unwrap();
     match fork().unwrap() {
-        ForkResult::Parent { .. } => {
+        ForkResult::Parent { child } => {
             thread::sleep(Duration::from_secs(1));
             {
                 let guard = condvar.1.lock();
@@ -15,6 +19,7 @@ fn main() {
                 drop(guard);
             }
             thread::sleep(Duration::from_secs(1));
+            waitpid(child, None).unwrap();
         }
         ForkResult::Child => {
             let mut guard = condvar.1.lock();

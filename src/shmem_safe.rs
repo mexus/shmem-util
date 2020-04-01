@@ -1,5 +1,4 @@
-use crate::{allocator::ShmemAlloc, memmap::MemmapAlloc};
-use alloc_collections::{boxes::CustomBox, deque::VecDeque, IndexMap, Vec};
+use alloc_collections::{boxes::CustomBox, deque::VecDeque, Alloc, IndexMap, Vec};
 use core::sync::atomic;
 
 /// Marker trait for types that are safe to be transmitted between processes.
@@ -53,15 +52,11 @@ unsafe impl<T: ShmemSafe> ShmemSafe for *mut T {}
 unsafe impl<T: ShmemSafe> ShmemSafe for *const T {}
 unsafe impl<T: ShmemSafe> ShmemSafe for atomic::AtomicPtr<T> {}
 
-unsafe impl<T: ShmemSafe> ShmemSafe for VecDeque<T, MemmapAlloc> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for Vec<T, MemmapAlloc> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for IndexMap<T, MemmapAlloc> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for CustomBox<T, MemmapAlloc> {}
-
-unsafe impl<T: ShmemSafe> ShmemSafe for VecDeque<T, ShmemAlloc> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for Vec<T, ShmemAlloc> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for IndexMap<T, ShmemAlloc> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for CustomBox<T, ShmemAlloc> {}
+// Some "heap"-allocated types.
+unsafe impl<T: ShmemSafe, A: Alloc + ShmemSafe> ShmemSafe for VecDeque<T, A> {}
+unsafe impl<T: ShmemSafe, A: Alloc + ShmemSafe> ShmemSafe for Vec<T, A> {}
+unsafe impl<T: ShmemSafe, A: Alloc + ShmemSafe> ShmemSafe for IndexMap<T, A> {}
+unsafe impl<T: ShmemSafe, A: Alloc + ShmemSafe> ShmemSafe for CustomBox<T, A> {}
 
 macro_rules! impl_array {
     ($($size:expr),* $(,)?) => {

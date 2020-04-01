@@ -5,6 +5,7 @@ use rand::{
     Rng, SeedableRng,
 };
 use shmem_utils::{
+    allocator::ShmemAlloc,
     channel::{Channel, Receiver, Sender},
     ShmemSafe,
 };
@@ -54,15 +55,15 @@ unsafe impl<T: ShmemSafe> ShmemSafe for Request<T> {}
 struct Response<T>(T);
 unsafe impl<T: ShmemSafe> ShmemSafe for Response<T> {}
 
-fn bench<T>(b: &mut criterion::Bencher<'_>, queue_length: usize)
+fn bench<T>(b: &mut criterion::Bencher<'_>, queue_length: usize, allocator: ShmemAlloc)
 where
     T: ShmemSafe + Send + 'static,
     Standard: Distribution<T>,
 {
     let mut rng = SmallRng::seed_from_u64(1234);
 
-    let chan1 = Channel::<Request<T>>::new(queue_length).unwrap();
-    let chan2 = Channel::<Response<T>>::new(queue_length).unwrap();
+    let chan1 = Channel::<Request<T>>::new(queue_length, allocator).unwrap();
+    let chan2 = Channel::<Response<T>>::new(queue_length, allocator).unwrap();
 
     let from_client = chan1.make_receiver();
     let to_server = chan1.make_sender();
@@ -96,14 +97,16 @@ pub fn criterion_benchmark(c: &mut Criterion) {
 
     const CAPACITY: usize = 2;
 
+    let allocator = ShmemAlloc::new(ShmemAlloc::ALIGNMENT * 1024).unwrap();
+
     group.bench_function(format!("smol ping, cap = {}", CAPACITY), |b| {
-        bench::<SmolData>(b, CAPACITY)
+        bench::<SmolData>(b, CAPACITY, allocator)
     });
     group.bench_function(format!("medium ping, cap = {}", CAPACITY), |b| {
-        bench::<MediumData>(b, CAPACITY)
+        bench::<MediumData>(b, CAPACITY, allocator)
     });
     group.bench_function(format!("big ping, cap = {}", CAPACITY), |b| {
-        bench::<BigData>(b, CAPACITY)
+        bench::<BigData>(b, CAPACITY, allocator)
     });
     group.finish();
 }

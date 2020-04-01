@@ -1,7 +1,8 @@
 use crate::{
+    allocator::ShmemAlloc,
     condvar::Condvar,
-    memmap::MemmapAlloc,
     mutex::{Mutex, MutexGuard},
+    process_rc::{DecreaseResult, PerProcessReferences},
     shmem_safe::ShmemSafe,
 };
 use alloc_collections::{boxes::CustomBox, deque::VecDeque, raw_vec};
@@ -10,56 +11,9 @@ use snafu::Snafu;
 use std::{
     mem::ManuallyDrop,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     time::{Duration, Instant},
 };
-
-struct PerProcessReferences {
-    counter: AtomicUsize,
-    pid: AtomicI32,
-}
-
-enum DecreaseResult {
-    YouAreTheLastOne,
-    MoveAlong,
-}
-
-impl PerProcessReferences {
-    fn new() -> Self {
-        PerProcessReferences {
-            counter: AtomicUsize::new(1),
-            pid: AtomicI32::new(Pid::this().as_raw()),
-        }
-    }
-
-    fn increase(&self) {
-        let this_pid = Pid::this().as_raw();
-        let count = self.counter.load(Ordering::SeqCst);
-        if self.pid.swap(this_pid, Ordering::SeqCst) == this_pid {
-            self.counter.fetch_add(1, Ordering::SeqCst);
-        } else if count == 0 {
-            panic!("Unexpected situation: counter equals to zero!");
-        } else {
-            log::info!("Detected process change");
-            self.counter.fetch_sub(count - 1, Ordering::SeqCst);
-        }
-    }
-
-    /// Returns `true` if it was the last reference.
-    fn decrease(&self, current_pid: Pid) -> DecreaseResult {
-        let current_pid = current_pid.as_raw();
-        if self.pid.swap(current_pid, Ordering::SeqCst) == current_pid {
-            if self.counter.fetch_sub(1, Ordering::SeqCst) == 1 {
-                DecreaseResult::YouAreTheLastOne
-            } else {
-                DecreaseResult::MoveAlong
-            }
-        } else {
-            // We've tried to decrease a freshly copied-across-fork `Channel`.
-            DecreaseResult::YouAreTheLastOne
-        }
-    }
-}
 
 /// Communication channel. It is safe to share across process boundaries.
 ///
@@ -73,8 +27,10 @@ impl PerProcessReferences {
 pub struct Channel<T> {
     inner: NonNull<Inner<T>>,
 
-    /// Heap-allocated references.
+    /// Heap-allocated references. Heap, not in shared buffer!
     references: NonNull<PerProcessReferences>,
+
+    allocator: ShmemAlloc,
 
     original_pid: Pid,
 }
@@ -87,6 +43,7 @@ impl<T> Clone for Channel<T> {
             inner: self.inner,
             references,
             original_pid: self.original_pid,
+            allocator: self.allocator,
         }
     }
 }
@@ -96,8 +53,8 @@ unsafe impl<T: Sync> Sync for Channel<T> {}
 
 impl<T: ShmemSafe> Channel<T> {
     /// Creates an queue with a given capacity in shared memory.
-    pub fn new(capacity: usize) -> Result<Self, raw_vec::Error> {
-        let queue = VecDeque::<T, _>::with_capacity_in(capacity, MemmapAlloc)?;
+    pub fn new(capacity: usize, allocator: ShmemAlloc) -> Result<Self, raw_vec::Error> {
+        let queue = VecDeque::<T, _>::with_capacity_in(capacity, allocator)?;
         log::trace!("Queue allocated");
         let inner = Inner {
             mutex: Mutex::new(queue),
@@ -107,7 +64,7 @@ impl<T: ShmemSafe> Channel<T> {
             space_maybe_available: Condvar::new(),
             dropping: AtomicBool::new(false),
         };
-        let inner = CustomBox::new_in(inner, MemmapAlloc)
+        let inner = CustomBox::new_in(inner, allocator)
             .map_err(|e| raw_vec::Error::Allocation { source: e })?;
         log::trace!("\"Inner\" moved to shared memory");
         let (inner, _allocator) = inner.into_raw_parts();
@@ -120,6 +77,7 @@ impl<T: ShmemSafe> Channel<T> {
             inner,
             references,
             original_pid: Pid::this(),
+            allocator,
         })
     }
 
@@ -164,15 +122,15 @@ impl<T> Drop for Channel<T> {
         let inner = unsafe { self.inner.as_ref() };
         let current_pid = Pid::this();
 
-        if let DecreaseResult::MoveAlong = unsafe { self.references.as_ref() }.decrease(current_pid)
-        {
-            // Not the last reference.
-            return;
-        }
-
         if self.original_pid != current_pid {
             // This it not an owner of the queue.
             // No-op.
+            return;
+        }
+
+        if let DecreaseResult::MoveAlong = unsafe { self.references.as_ref() }.decrease(current_pid)
+        {
+            // Not the last reference.
             return;
         }
 
@@ -204,11 +162,13 @@ impl<T> Drop for Channel<T> {
         }
         // Here the guard is released, but we are sure we are the only ones who's referencing the
         // `Inner` pointer, because we've set both `senders` and `receivers` atomic to zeroes.
-        let inner = unsafe {
-            CustomBox::<Inner<T>, _>::from_raw_parts(self.inner, crate::memmap::MemmapAlloc)
-        };
+        let inner = unsafe { CustomBox::<Inner<T>, _>::from_raw_parts(self.inner, self.allocator) };
         drop(inner);
         log::trace!("Dropped the inner queue");
+
+        let references = unsafe { Box::<PerProcessReferences>::from_raw(self.references.as_mut()) };
+        drop(references);
+        log::trace!("Dropped the references");
     }
 }
 
@@ -378,7 +338,7 @@ impl<T> Drop for Receiver<T> {
 }
 
 struct Inner<T> {
-    mutex: Mutex<VecDeque<T, MemmapAlloc>>,
+    mutex: Mutex<VecDeque<T, ShmemAlloc>>,
     item_maybe_available: Condvar,
     space_maybe_available: Condvar,
 
@@ -406,7 +366,7 @@ impl<T> Inner<T> {
     #[inline(always)]
     fn push(
         &self,
-        mut guard: MutexGuard<VecDeque<T, MemmapAlloc>>,
+        mut guard: MutexGuard<VecDeque<T, ShmemAlloc>>,
         item: T,
     ) -> Result<(), raw_vec::Error> {
         guard.push_back(item)?;
@@ -417,7 +377,7 @@ impl<T> Inner<T> {
     }
 
     #[inline(always)]
-    fn pop(&self, guard: &mut MutexGuard<VecDeque<T, MemmapAlloc>>) -> Option<T> {
+    fn pop(&self, guard: &mut MutexGuard<VecDeque<T, ShmemAlloc>>) -> Option<T> {
         let item = guard.pop_front()?;
         self.space_maybe_available.signal();
         Some(item)
@@ -605,50 +565,49 @@ impl<T> Inner<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use nix::unistd::{fork, ForkResult};
-    use std::{io::Write, thread};
-
-    fn init_logging() {
-        let _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Warn)
-            .format(|f, record| {
-                writeln!(
-                    f,
-                    "[{:5}] [{}] {}:{} {}",
-                    record.level(),
-                    record.module_path().unwrap(),
-                    record.file().unwrap(),
-                    record.line().unwrap(),
-                    record.args()
-                )
-            })
-            .is_test(true)
-            .try_init();
-    }
+    use nix::{
+        sys::wait::waitpid,
+        unistd::{fork, ForkResult},
+    };
+    use std::thread;
 
     #[test]
     fn check() {
-        init_logging();
+        crate::init_logging();
+        let allocator = crate::shmem_allocator();
 
-        let channel = Channel::<usize>::new(1234).unwrap();
+        let channel = Channel::<Sender<u128>>::new(1, allocator).unwrap();
 
         let processor = channel.make_receiver();
 
         match fork().unwrap() {
-            ForkResult::Parent { child: _ } => {
+            ForkResult::Parent { child } => {
                 // Wait for a sender to initialize.
                 thread::sleep(Duration::from_millis(100));
 
                 log::info!("Waiting for request");
-                let value = processor.receive().unwrap();
-                log::info!("Received value");
-                assert_eq!(value, 1234);
+                let reply_sender = processor.receive().unwrap();
+                log::info!("Received reply sender");
+
+                thread::sleep(Duration::from_millis(200));
+
+                reply_sender.send(1).unwrap();
+
+                waitpid(child, None).unwrap();
             }
             ForkResult::Child => {
                 let sender = channel.make_sender();
                 log::info!("Sending");
-                sender.send(1234).unwrap();
-                log::info!("Sent!")
+
+                let reply_channel = Channel::<u128>::new(1, allocator).unwrap();
+                let reply_receiver = reply_channel.make_receiver();
+                let reply_sender = reply_channel.make_sender();
+
+                assert!(sender.send(reply_sender).is_ok());
+                log::info!("Sent reply sender!");
+
+                let reply = reply_receiver.receive();
+                assert_eq!(reply, Some(1));
             }
         }
     }

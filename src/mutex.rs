@@ -1,6 +1,6 @@
 use crate::strerror;
-use crate::{allocator::ShmemAlloc, memmap::MemmapAlloc, time::UnixClock, ShmemSafe};
-use alloc_collections::boxes::CustomBox;
+use crate::{time::UnixClock, ShmemSafe};
+use alloc_collections::{boxes::CustomBox, Alloc};
 use nix::unistd::Pid;
 use std::{
     cell::UnsafeCell,
@@ -66,8 +66,13 @@ pub struct Mutex<T> {
 
 unsafe impl<T: Send> Send for Mutex<T> {}
 unsafe impl<T: Send> Sync for Mutex<T> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for CustomBox<Mutex<T>, MemmapAlloc> {}
-unsafe impl<T: ShmemSafe> ShmemSafe for CustomBox<Mutex<T>, ShmemAlloc> {}
+
+unsafe impl<T, A> ShmemSafe for CustomBox<Mutex<T>, A>
+where
+    T: ShmemSafe,
+    A: Alloc + ShmemSafe,
+{
+}
 
 /// Mutex RAII guard.
 ///
@@ -236,7 +241,7 @@ impl<T> Drop for Mutex<T> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{init_logging, memmap::MemmapAlloc};
+    use crate::init_logging;
     use alloc_collections::boxes::CustomBox;
     use nix::{
         sys::wait::waitpid,
@@ -256,10 +261,11 @@ mod test {
     #[test]
     fn check_drop() {
         init_logging();
+        let allocator = crate::shmem_allocator();
 
-        let mut counter = CustomBox::new_in(0, MemmapAlloc).unwrap();
+        let mut counter = CustomBox::new_in(0, allocator).unwrap();
 
-        let mutex = CustomBox::new_in(Mutex::new(Check(&mut counter)), MemmapAlloc).unwrap();
+        let mutex = CustomBox::new_in(Mutex::new(Check(&mut counter)), allocator).unwrap();
 
         match fork().unwrap() {
             ForkResult::Parent { child } => {
@@ -308,20 +314,22 @@ mod test {
     #[test]
     fn check_fork() {
         init_logging();
+        let allocator = crate::shmem_allocator();
 
-        let mutex = CustomBox::new_in(Mutex::new(0usize), MemmapAlloc).unwrap();
+        let mutex = CustomBox::new_in(Mutex::new(0usize), allocator).unwrap();
 
         match fork().unwrap() {
             ForkResult::Parent { child } => {
                 let guard = mutex.lock();
                 assert_eq!(*guard, 0);
                 drop(guard);
-                thread::sleep(Duration::from_millis(10));
+                thread::sleep(Duration::from_millis(200));
                 let guard = mutex.lock();
                 assert_eq!(*guard, 1);
                 waitpid(child, None).unwrap();
             }
             ForkResult::Child => {
+                thread::sleep(Duration::from_millis(100));
                 let mut guard = mutex.lock();
                 *guard += 1;
             }
@@ -331,8 +339,9 @@ mod test {
     #[test]
     fn check_wait_until() {
         init_logging();
+        let allocator = crate::shmem_allocator();
 
-        let mutex = CustomBox::new_in(Mutex::new(0usize), MemmapAlloc).unwrap();
+        let mutex = CustomBox::new_in(Mutex::new(0usize), allocator).unwrap();
 
         match fork().unwrap() {
             ForkResult::Parent { child } => {

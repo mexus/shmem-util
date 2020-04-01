@@ -1,5 +1,5 @@
 pub mod allocator;
-mod autoclean;
+// mod autoclean;
 pub mod channel;
 pub mod condvar;
 pub mod memmap;
@@ -10,6 +10,8 @@ mod time;
 
 mod shmem_safe;
 pub use shmem_safe::ShmemSafe;
+
+mod process_rc;
 
 fn strerror(errno: libc::c_int) -> String {
     unsafe {
@@ -41,4 +43,9 @@ fn init_logging() {
         })
         .is_test(true)
         .try_init();
+}
+
+#[cfg(test)]
+pub fn shmem_allocator() -> allocator::ShmemAlloc {
+    allocator::ShmemAlloc::new(1024 * 1024).unwrap()
 }

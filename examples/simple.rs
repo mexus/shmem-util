@@ -1,5 +1,8 @@
-use nix::unistd::{fork, ForkResult, Pid};
-use shmem_utils::channel::Channel;
+use nix::{
+    sys::wait::waitpid,
+    unistd::{fork, ForkResult, Pid},
+};
+use shmem_utils::{allocator::ShmemAlloc, channel::Channel};
 use std::{io::Write, thread, time::Duration};
 
 fn main() {
@@ -19,7 +22,9 @@ fn main() {
         })
         .init();
 
-    let channel = Channel::<i32>::new(1234).unwrap();
+    let allocator = ShmemAlloc::new(10 * 1024 * 1024).unwrap();
+
+    let channel = Channel::<i32>::new(1234, allocator).unwrap();
 
     let receiver = channel.make_receiver();
 
@@ -34,6 +39,7 @@ fn main() {
             log::info!("Everything's okay on the parent's side");
 
             thread::sleep(Duration::from_secs(1));
+            waitpid(child, None).unwrap();
         }
         ForkResult::Child => {
             let sender = channel.make_sender();

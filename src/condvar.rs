@@ -1,8 +1,5 @@
-use crate::{
-    allocator::ShmemAlloc, memmap::MemmapAlloc, mutex::MutexGuard, strerror, time::UnixClock,
-    ShmemSafe,
-};
-use alloc_collections::boxes::CustomBox;
+use crate::{mutex::MutexGuard, strerror, time::UnixClock, ShmemSafe};
+use alloc_collections::{boxes::CustomBox, Alloc};
 use nix::unistd::Pid;
 use std::{
     cell::UnsafeCell,
@@ -23,8 +20,7 @@ pub struct Condvar {
 
 unsafe impl Send for Condvar {}
 unsafe impl Sync for Condvar {}
-unsafe impl ShmemSafe for CustomBox<Condvar, MemmapAlloc> {}
-unsafe impl ShmemSafe for CustomBox<Condvar, ShmemAlloc> {}
+unsafe impl<A: Alloc + ShmemSafe> ShmemSafe for CustomBox<Condvar, A> {}
 
 #[derive(Debug)]
 pub(crate) struct CondAttr(libc::pthread_condattr_t);
@@ -231,7 +227,7 @@ impl Drop for Condvar {
 #[cfg(test)]
 mod test {
     use super::*;
-    use crate::{init_logging, memmap::MemmapAlloc, mutex::Mutex};
+    use crate::{init_logging, mutex::Mutex};
     use alloc_collections::boxes::CustomBox;
     use crossbeam_utils::thread::scope;
     use nix::{
@@ -284,11 +280,12 @@ mod test {
     #[test]
     fn check_fork() {
         init_logging();
+        let allocator = crate::shmem_allocator();
 
         let var = Condvar::new();
-        let var = CustomBox::new_in(var, MemmapAlloc).unwrap();
+        let var = CustomBox::new_in(var, allocator).unwrap();
 
-        let data = CustomBox::new_in(0usize, MemmapAlloc).unwrap();
+        let data = CustomBox::new_in(0usize, allocator).unwrap();
         let mutex = Mutex::new(data);
 
         match fork().unwrap() {
@@ -317,6 +314,8 @@ mod test {
 
     #[test]
     fn check_wait_timeout() {
+        init_logging();
+
         let pair = Arc::new((Condvar::new(), Mutex::new(0usize)));
 
         let child_thread = {
